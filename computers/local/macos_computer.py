@@ -1,6 +1,9 @@
 import base64
 import io
 import time
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import List, Dict, Literal
 import pyautogui
 import psutil
@@ -10,6 +13,10 @@ from ..computer import Computer
 
 class MacOSComputer:
     """Native macOS computer automation using PyAutoGUI and system APIs."""
+    
+    # Target resolution for scaled screenshots (same as mac_computer_use)
+    SCALE_TARGET_WIDTH = 1366
+    SCALE_TARGET_HEIGHT = 768
     
     def __init__(self):
         """Initialize macOS computer automation."""
@@ -21,34 +28,61 @@ class MacOSComputer:
         pyautogui.FAILSAFE = True  # Move mouse to corner to abort
         pyautogui.PAUSE = 0.1  # Small delay between actions
         
-        # Get screen dimensions
+        # Get actual screen dimensions from PyAutoGUI
         self._width, self._height = pyautogui.size()
+        
+        # Calculate scaling factors for coordinate transformation
+        # When AI sends coordinates, they're in scaled space and need to be scaled up
+        self._x_scale_factor = self._width / self.SCALE_TARGET_WIDTH
+        self._y_scale_factor = self._height / self.SCALE_TARGET_HEIGHT
+        
+        print(f"Screen dimensions: {self._width}x{self._height}")
+        print(f"Screenshot scaling: {self.SCALE_TARGET_WIDTH}x{self.SCALE_TARGET_HEIGHT}")
+        print(f"Coordinate scale factors: {self._x_scale_factor:.2f}x{self._y_scale_factor:.2f}")
     
     def get_environment(self) -> Literal["windows", "mac", "linux", "browser"]:
         """Return the environment type."""
         return "mac"
     
     def get_dimensions(self) -> tuple[int, int]:
-        """Get screen dimensions."""
+        """Get screen dimensions - returns actual screen size."""
         return self._width, self._height
+    
+    def _scale_coordinates_from_ai(self, x: int, y: int) -> tuple[int, int]:
+        """Scale coordinates from AI (scaled screenshot space) to actual screen space."""
+        # AI sends coordinates based on scaled screenshot (1366x768)
+        # We need to scale them up to actual screen dimensions
+        actual_x = int(x * self._x_scale_factor)
+        actual_y = int(y * self._y_scale_factor)
+        return actual_x, actual_y
     
     def screenshot(self) -> str:
         """Take a screenshot and return as base64 encoded string."""
         # Take screenshot using PyAutoGUI
         screenshot = pyautogui.screenshot()
         
+        # Scale down to target resolution for efficiency
+        # This matches what mac_computer_use does
+        scaled_screenshot = screenshot.resize(
+            (self.SCALE_TARGET_WIDTH, self.SCALE_TARGET_HEIGHT),
+            Image.Resampling.LANCZOS
+        )
+        
         # Convert to base64
         buffer = io.BytesIO()
-        screenshot.save(buffer, format='PNG')
+        scaled_screenshot.save(buffer, format='PNG')
         img_str = base64.b64encode(buffer.getvalue()).decode()
         
         return f"data:image/png;base64,{img_str}"
     
     def click(self, x: int, y: int, button: str = "left") -> None:
         """Click at the specified coordinates."""
-        # Validate coordinates
-        if not (0 <= x <= self._width and 0 <= y <= self._height):
-            raise ValueError(f"Coordinates ({x}, {y}) are outside screen bounds")
+        # Validate coordinates against scaled screenshot dimensions
+        if not (0 <= x <= self.SCALE_TARGET_WIDTH and 0 <= y <= self.SCALE_TARGET_HEIGHT):
+            raise ValueError(f"Coordinates ({x}, {y}) are outside scaled bounds {self.SCALE_TARGET_WIDTH}x{self.SCALE_TARGET_HEIGHT}")
+        
+        # Scale coordinates from AI space to actual screen space
+        actual_x, actual_y = self._scale_coordinates_from_ai(x, y)
         
         # Map button names
         button_map = {
@@ -60,28 +94,39 @@ class MacOSComputer:
         if button not in button_map:
             raise ValueError(f"Unknown button: {button}")
         
-        pyautogui.click(x, y, button=button_map[button])
+        pyautogui.click(actual_x, actual_y, button=button_map[button])
     
     def double_click(self, x: int, y: int) -> None:
         """Double-click at the specified coordinates."""
-        if not (0 <= x <= self._width and 0 <= y <= self._height):
-            raise ValueError(f"Coordinates ({x}, {y}) are outside screen bounds")
+        if not (0 <= x <= self.SCALE_TARGET_WIDTH and 0 <= y <= self.SCALE_TARGET_HEIGHT):
+            raise ValueError(f"Coordinates ({x}, {y}) are outside scaled bounds {self.SCALE_TARGET_WIDTH}x{self.SCALE_TARGET_HEIGHT}")
         
-        pyautogui.doubleClick(x, y)
+        # Scale coordinates from AI space to actual screen space
+        actual_x, actual_y = self._scale_coordinates_from_ai(x, y)
+        pyautogui.doubleClick(actual_x, actual_y)
     
-    def scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
-        """Scroll at the specified coordinates."""
-        if not (0 <= x <= self._width and 0 <= y <= self._height):
-            raise ValueError(f"Coordinates ({x}, {y}) are outside screen bounds")
+    def scroll(self, x: int = None, y: int = None, direction: str = "down", amount: int = 5) -> None:
+        """Scroll at the specified coordinates or current position."""
+        # Handle both old and new scroll API formats
+        if isinstance(x, str):  # New format: scroll(direction="down", amount=5)
+            direction = x
+            amount = y if y is not None else 5
+            x = None
+            y = None
         
-        # Move to position and scroll
-        pyautogui.moveTo(x, y)
+        # If coordinates provided, move there first
+        if x is not None and y is not None:
+            if not (0 <= x <= self.SCALE_TARGET_WIDTH and 0 <= y <= self.SCALE_TARGET_HEIGHT):
+                raise ValueError(f"Coordinates ({x}, {y}) are outside scaled bounds {self.SCALE_TARGET_WIDTH}x{self.SCALE_TARGET_HEIGHT}")
+            actual_x, actual_y = self._scale_coordinates_from_ai(x, y)
+            pyautogui.moveTo(actual_x, actual_y)
         
-        # PyAutoGUI scroll: positive = up/right, negative = down/left
-        if scroll_y != 0:
-            pyautogui.scroll(scroll_y, x=x, y=y)
-        if scroll_x != 0:
-            pyautogui.hscroll(scroll_x, x=x, y=y)
+        # Scroll based on direction
+        scroll_amount = amount if direction in ["down", "right"] else -amount
+        if direction in ["up", "down"]:
+            pyautogui.scroll(scroll_amount)
+        elif direction in ["left", "right"]:
+            pyautogui.hscroll(scroll_amount)
     
     def type(self, text: str) -> None:
         """Type the specified text."""
@@ -92,16 +137,22 @@ class MacOSComputer:
         for key in keys:
             pyautogui.press(key)
     
-    def wait(self, ms: int = 1000) -> None:
-        """Wait for the specified number of milliseconds."""
-        time.sleep(ms / 1000)
+    def wait(self, seconds: float = 1.0) -> None:
+        """Wait for the specified number of seconds."""
+        time.sleep(seconds)
     
     def move(self, x: int, y: int) -> None:
         """Move mouse to the specified coordinates."""
-        if not (0 <= x <= self._width and 0 <= y <= self._height):
-            raise ValueError(f"Coordinates ({x}, {y}) are outside screen bounds")
+        if not (0 <= x <= self.SCALE_TARGET_WIDTH and 0 <= y <= self.SCALE_TARGET_HEIGHT):
+            raise ValueError(f"Coordinates ({x}, {y}) are outside scaled bounds {self.SCALE_TARGET_WIDTH}x{self.SCALE_TARGET_HEIGHT}")
         
-        pyautogui.moveTo(x, y)
+        # Scale coordinates from AI space to actual screen space
+        actual_x, actual_y = self._scale_coordinates_from_ai(x, y)
+        pyautogui.moveTo(actual_x, actual_y)
+    
+    def mouse_move(self, x: int, y: int) -> None:
+        """Alias for move() to match OpenAI CUA action names."""
+        return self.move(x, y)
     
     def keypress(self, keys: List[str]) -> None:
         """Press the specified key combination."""
@@ -152,18 +203,20 @@ class MacOSComputer:
         # Validate all coordinates
         for point in path:
             x, y = point.get('x', 0), point.get('y', 0)
-            if not (0 <= x <= self._width and 0 <= y <= self._height):
-                raise ValueError(f"Coordinates ({x}, {y}) are outside screen bounds")
+            if not (0 <= x <= self.SCALE_TARGET_WIDTH and 0 <= y <= self.SCALE_TARGET_HEIGHT):
+                raise ValueError(f"Coordinates ({x}, {y}) are outside scaled bounds {self.SCALE_TARGET_WIDTH}x{self.SCALE_TARGET_HEIGHT}")
         
-        # Start drag from first point
+        # Convert first point and start drag
         start_point = path[0]
-        pyautogui.moveTo(start_point['x'], start_point['y'])
+        start_x, start_y = self._scale_coordinates_from_ai(start_point['x'], start_point['y'])
+        pyautogui.moveTo(start_x, start_y)
         pyautogui.mouseDown()
         
         try:
             # Drag through all subsequent points
             for point in path[1:]:
-                pyautogui.moveTo(point['x'], point['y'])
+                actual_x, actual_y = self._scale_coordinates_from_ai(point['x'], point['y'])
+                pyautogui.moveTo(actual_x, actual_y)
                 time.sleep(0.05)  # Small delay for smooth dragging
         finally:
             # Always release mouse button
